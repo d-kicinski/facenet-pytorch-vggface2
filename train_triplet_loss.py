@@ -1,3 +1,8 @@
+import dataclasses
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping, Any, List
+
 import numpy as np
 import argparse
 import os
@@ -6,7 +11,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.transforms as transforms
+from torch.cuda.amp import GradScaler, autocast
 from torch.nn.modules.distance import PairwiseDistance
+from torch.utils.tensorboard import SummaryWriter
 from datasets.LFWDataset import LFWDataset
 from losses.triplet_loss import TripletLoss
 from datasets.TripletLossDataset import TripletFaceDataset
@@ -23,6 +30,27 @@ from models.resnet import (
     Resnet152Triplet
 )
 
+# Timing utilities
+import time
+start_time = None
+
+
+def start_timer():
+    global start_time
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_max_memory_allocated()
+    torch.cuda.synchronize()
+    start_time = time.time()
+
+
+def end_timer_and_print(local_msg):
+    torch.cuda.synchronize()
+    end_time = time.time()
+    print("\n" + local_msg)
+    print("Total execution time = {:.3f} sec".format(end_time - start_time))
+    print("Max memory used by tensors = {} bytes".format(torch.cuda.max_memory_allocated()))
+
 
 parser = argparse.ArgumentParser(description="Training a FaceNet facial recognition model using Triplet Loss.")
 parser.add_argument('--dataroot', '-d', type=str, required=True,
@@ -34,28 +62,29 @@ parser.add_argument('--lfw', type=str, required=True,
 parser.add_argument('--dataset_csv', type=str, default='datasets/vggface2_full.csv',
                     help="Path to the csv file containing the image paths of the training dataset."
                     )
-parser.add_argument('--epochs', default=150, type=int,
+parser.add_argument('--epochs', default=50, type=int,
                     help="Required training epochs (default: 150)"
                     )
 parser.add_argument('--iterations_per_epoch', default=10000, type=int,
                     help="Number of training iterations per epoch (default: 10000)"
                     )
-parser.add_argument('--model_architecture', type=str, default="resnet18", choices=["resnet18", "resnet34", "resnet50", "resnet101", "resnet152", "inceptionresnetv2", "mobilenetv2"],
+parser.add_argument('--model_architecture', type=str, default="resnet18", choices=["resnet18",
+                                                                            "resnet34", "resnet50", "resnet101", "resnet152", "inceptionresnetv2", "mobilenetv2"],
                     help="The required model architecture for training: ('resnet18','resnet34', 'resnet50', 'resnet101', 'resnet152', 'inceptionresnetv2', 'mobilenetv2'), (default: 'resnet18')"
                     )
 parser.add_argument('--pretrained', default=False, type=bool,
                     help="Download a model pretrained on the ImageNet dataset (Default: False)"
                     )
-parser.add_argument('--embedding_dimension', default=512, type=int,
+parser.add_argument('--embedding_dimension', default=256, type=int,
                     help="Dimension of the embedding vector (default: 512)"
                     )
-parser.add_argument('--num_human_identities_per_batch', default=32, type=int,
+parser.add_argument('--num_human_identities_per_batch', default=24, type=int,
                     help="Number of set human identities per generated triplets batch. (Default: 32)."
                     )
-parser.add_argument('--batch_size', default=320, type=int,
+parser.add_argument('--batch_size', default=192, type=int,
                     help="Batch size (default: 320)"
                     )
-parser.add_argument('--lfw_batch_size', default=320, type=int,
+parser.add_argument('--lfw_batch_size', default=64, type=int,
                     help="Batch size for LFW dataset (default: 320)"
                     )
 parser.add_argument('--num_generate_triplets_processes', default=0, type=int,
@@ -64,13 +93,13 @@ parser.add_argument('--num_generate_triplets_processes', default=0, type=int,
 parser.add_argument('--resume_path', default='',  type=str,
                     help='path to latest model checkpoint: (model_training_checkpoints/model_resnet18_epoch_1.pt file) (default: None)'
                     )
-parser.add_argument('--num_workers', default=2, type=int,
+parser.add_argument('--num_workers', default=4, type=int,
                     help="Number of workers for data loaders (default: 2)"
                     )
-parser.add_argument('--optimizer', type=str, default="adagrad", choices=["sgd", "adagrad", "rmsprop", "adam"],
+parser.add_argument('--optimizer', type=str, default="adam", choices=["sgd", "adagrad", "rmsprop", "adam"],
                     help="Required optimizer for training the model: ('sgd','adagrad','rmsprop','adam'), (default: 'adagrad')"
                     )
-parser.add_argument('--learning_rate', default=0.1, type=float,
+parser.add_argument('--learning_rate', default=0.001, type=float,
                     help="Learning rate for the optimizer (default: 0.1)"
                     )
 parser.add_argument('--margin', default=0.2, type=float,
@@ -176,7 +205,7 @@ def set_optimizer(optimizer, model, learning_rate):
         )
 
     elif optimizer == "adam":
-        optimizer_model = optim.Adam(
+        optimizer_model = optim.AdamW(
             params=model.parameters(),
             lr=learning_rate,
             betas=(0.9, 0.999),
@@ -187,7 +216,7 @@ def set_optimizer(optimizer, model, learning_rate):
     return optimizer_model
 
 
-def validate_lfw(model, lfw_dataloader, model_architecture, epoch, epochs):
+def validate_lfw(model, lfw_dataloader, model_architecture, epoch, epochs, log=False):
     model.eval()
     with torch.no_grad():
         l2_distance = PairwiseDistance(p=2)
@@ -215,10 +244,29 @@ def validate_lfw(model, lfw_dataloader, model_architecture, epoch, epochs):
             labels=labels,
             far_target=1e-3
         )
-        # Print statistics and add to log
-        print("Accuracy on LFW: {:.4f}+-{:.4f}\tPrecision {:.4f}+-{:.4f}\tRecall {:.4f}+-{:.4f}\t"
-              "ROC Area Under Curve: {:.4f}\tBest distance threshold: {:.2f}+-{:.2f}\t"
-              "TAR: {:.4f}+-{:.4f} @ FAR: {:.4f}".format(
+
+        if log:
+            # Print statistics and add to log
+            print("Accuracy on LFW: {:.4f}+-{:.4f}\tPrecision {:.4f}+-{:.4f}\tRecall {:.4f}+-{:.4f}\t"
+                  "ROC Area Under Curve: {:.4f}\tBest distance threshold: {:.2f}+-{:.2f}\t"
+                  "TAR: {:.4f}+-{:.4f} @ FAR: {:.4f}".format(
+                        np.mean(accuracy),
+                        np.std(accuracy),
+                        np.mean(precision),
+                        np.std(precision),
+                        np.mean(recall),
+                        np.std(recall),
+                        roc_auc,
+                        np.mean(best_distances),
+                        np.std(best_distances),
+                        np.mean(tar),
+                        np.std(tar),
+                        np.mean(far)
+                    )
+            )
+            with open('logs/lfw_{}_log_triplet.txt'.format(model_architecture), 'a') as f:
+                val_list = [
+                    epoch,
                     np.mean(accuracy),
                     np.std(accuracy),
                     np.mean(precision),
@@ -228,45 +276,31 @@ def validate_lfw(model, lfw_dataloader, model_architecture, epoch, epochs):
                     roc_auc,
                     np.mean(best_distances),
                     np.std(best_distances),
-                    np.mean(tar),
-                    np.std(tar),
-                    np.mean(far)
-                )
-        )
-        with open('logs/lfw_{}_log_triplet.txt'.format(model_architecture), 'a') as f:
-            val_list = [
-                epoch,
-                np.mean(accuracy),
-                np.std(accuracy),
-                np.mean(precision),
-                np.std(precision),
-                np.mean(recall),
-                np.std(recall),
-                roc_auc,
-                np.mean(best_distances),
-                np.std(best_distances),
-                np.mean(tar)
-            ]
-            log = '\t'.join(str(value) for value in val_list)
-            f.writelines(log + '\n')
+                    np.mean(tar)
+                ]
+                log = '\t'.join(str(value) for value in val_list)
+                f.writelines(log + '\n')
 
-    try:
-        # Plot ROC curve
-        plot_roc_lfw(
-            false_positive_rate=false_positive_rate,
-            true_positive_rate=true_positive_rate,
-            figure_name="plots/roc_plots/roc_{}_epoch_{}_triplet.png".format(model_architecture, epoch)
-        )
-        # Plot LFW accuracies plot
-        plot_accuracy_lfw(
-            log_dir="logs/lfw_{}_log_triplet.txt".format(model_architecture),
-            epochs=epochs,
-            figure_name="plots/lfw_accuracies_{}_triplet.png".format(model_architecture)
-        )
-    except Exception as e:
-        print(e)
+    return EvaluationMetrics(
+        accuracy=float(np.mean(accuracy)),
+        precision=float(np.mean(precision)),
+        recall=float(np.mean(recall)),
+        roc_auc=roc_auc,
+        tar=float(np.mean(tar)),
+        far=float(np.mean(far)),
+        distance=float(np.mean(best_distances)),
+    )
 
-    return best_distances
+
+@dataclass
+class EvaluationMetrics:
+    accuracy: float
+    precision: float
+    recall: float
+    roc_auc: float
+    tar: float
+    far: float
+    distance: float
 
 
 def forward_pass(imgs, model, batch_size):
@@ -283,6 +317,18 @@ def forward_pass(imgs, model, batch_size):
     gc.collect()
 
     return anc_embeddings, pos_embeddings, neg_embeddings, model
+
+
+class Tensorboard:
+    def __init__(self, log_path: Path):
+        self._writer = SummaryWriter(str(log_path))
+
+    def add_dict(self, dictionary: Mapping[str, Any], global_step: int):
+        for key, value in dictionary.items():
+            self._writer.add_scalar(key, value, global_step=global_step)
+
+    def add_scalar(self, name: str, value: float, global_step: int):
+        self._writer.add_scalar(name, value, global_step=global_step)
 
 
 def main():
@@ -391,6 +437,22 @@ def main():
 
     print("Training using triplet loss starting for {} epochs:\n".format(epochs - start_epoch))
 
+    tensorboard_dir = Path("logs/tensorboard")
+    tensorboard_dir.mkdir(exist_ok=True, parents=True)
+    tensorboard = Tensorboard(tensorboard_dir)
+    global_step = 0
+    log_every_step = 500
+    evaluate_every_step = 2000
+    losses: List[float] = []
+    valid_triplets_acc: List[int] = [0]
+
+    scaler = GradScaler()
+
+    # start_epoch = 0
+    # epochs = 1
+    use_amp = True
+    iters_to_accumulate = 6
+    # start_timer()
     for epoch in range(start_epoch, epochs):
         num_valid_training_triplets = 0
         l2_distance = PairwiseDistance(p=2)
@@ -434,55 +496,91 @@ def main():
             #  issues
             all_imgs = torch.cat((anc_imgs, pos_imgs, neg_imgs))  # Must be a tuple of Torch Tensors
 
-            anc_embeddings, pos_embeddings, neg_embeddings, model = forward_pass(
-                imgs=all_imgs,
-                model=model,
-                batch_size=batch_size
-            )
+            with autocast(enabled=use_amp):
+                anc_embeddings, pos_embeddings, neg_embeddings, model = forward_pass(
+                    imgs=all_imgs,
+                    model=model,
+                    batch_size=batch_size
+                )
 
-            pos_dists = l2_distance.forward(anc_embeddings, pos_embeddings)
-            neg_dists = l2_distance.forward(anc_embeddings, neg_embeddings)
+                pos_dists = l2_distance.forward(anc_embeddings, pos_embeddings)
+                neg_dists = l2_distance.forward(anc_embeddings, neg_embeddings)
 
-            if use_semihard_negatives:
-                # Semi-Hard Negative triplet selection
-                #  (negative_distance - positive_distance < margin) AND (positive_distance < negative_distance)
-                #   Based on: https://github.com/davidsandberg/facenet/blob/master/src/train_tripletloss.py#L295
-                first_condition = (neg_dists - pos_dists < margin).cpu().numpy().flatten()
-                second_condition = (pos_dists < neg_dists).cpu().numpy().flatten()
-                all = (np.logical_and(first_condition, second_condition))
-                valid_triplets = np.where(all == 1)
-            else:
-                # Hard Negative triplet selection
-                #  (negative_distance - positive_distance < margin)
-                #   Based on: https://github.com/davidsandberg/facenet/blob/master/src/train_tripletloss.py#L296
-                all = (neg_dists - pos_dists < margin).cpu().numpy().flatten()
-                valid_triplets = np.where(all == 1)
+                if use_semihard_negatives:
+                    # Semi-Hard Negative triplet selection
+                    #  (negative_distance - positive_distance < margin) AND (positive_distance < negative_distance)
+                    #   Based on: https://github.com/davidsandberg/facenet/blob/master/src/train_tripletloss.py#L295
+                    first_condition = (neg_dists - pos_dists < margin).cpu().numpy().flatten()
+                    second_condition = (pos_dists < neg_dists).cpu().numpy().flatten()
+                    all = (np.logical_and(first_condition, second_condition))
+                    valid_triplets = np.where(all == 1)
+                else:
+                    # Hard Negative triplet selection
+                    #  (negative_distance - positive_distance < margin)
+                    #   Based on: https://github.com/davidsandberg/facenet/blob/master/src/train_tripletloss.py#L296
+                    all = (neg_dists - pos_dists < margin).cpu().numpy().flatten()
+                    valid_triplets = np.where(all == 1)
 
-            anc_valid_embeddings = anc_embeddings[valid_triplets]
-            pos_valid_embeddings = pos_embeddings[valid_triplets]
-            neg_valid_embeddings = neg_embeddings[valid_triplets]
+                anc_valid_embeddings = anc_embeddings[valid_triplets]
+                pos_valid_embeddings = pos_embeddings[valid_triplets]
+                neg_valid_embeddings = neg_embeddings[valid_triplets]
 
-            del anc_embeddings, pos_embeddings, neg_embeddings, pos_dists, neg_dists
-            gc.collect()
+                del anc_embeddings, pos_embeddings, neg_embeddings, pos_dists, neg_dists
+                gc.collect()
 
-            # Calculate triplet loss
-            triplet_loss = TripletLoss(margin=margin).forward(
-                anchor=anc_valid_embeddings,
-                positive=pos_valid_embeddings,
-                negative=neg_valid_embeddings
-            )
+                # Calculate triplet loss
+                triplet_loss = TripletLoss(margin=margin).forward(
+                    anchor=anc_valid_embeddings,
+                    positive=pos_valid_embeddings,
+                    negative=neg_valid_embeddings
+                )
+                triplet_loss = triplet_loss / iters_to_accumulate
 
             # Calculating number of triplets that met the triplet selection method during the epoch
             num_valid_training_triplets += len(anc_valid_embeddings)
+            valid_triplets_acc[-1] += len(anc_valid_embeddings)
 
-            # Backward pass
-            optimizer_model.zero_grad()
-            triplet_loss.backward()
-            optimizer_model.step()
+            scaler.scale(triplet_loss).backward()
 
-            # Clear some memory at end of training iteration
-            del triplet_loss, anc_valid_embeddings, pos_valid_embeddings, neg_valid_embeddings
-            gc.collect()
+            if (batch_idx + 1) % iters_to_accumulate == 0:
+                # Backward pass
+                scaler.step(optimizer_model)
+                scaler.update()
+                optimizer_model.zero_grad()
+
+                losses.append(triplet_loss.item())
+                global_step += 1
+
+                # Clear some memory at end of training iteration
+                del triplet_loss, anc_valid_embeddings, pos_valid_embeddings, neg_valid_embeddings
+                gc.collect()
+
+                if global_step % log_every_step == 0:
+                    tensorboard.add_scalar(
+                        name="loss_train",
+                        value=sum(losses) / len(losses),
+                        global_step=global_step,
+                    )
+                    tensorboard.add_scalar(
+                        name="valid_triplets",
+                        value=sum(valid_triplets_acc) / len(valid_triplets_acc),
+                        global_step=global_step,
+                    )
+                    losses: List[float] = []
+                    valid_triplets_acc: List[int] = [0]
+                if global_step % evaluate_every_step == 0:
+                    print("Validating on LFW!")
+
+                    metrics = validate_lfw(
+                        model=model,
+                        lfw_dataloader=lfw_dataloader,
+                        model_architecture=model_architecture,
+                        epoch=epoch,
+                        epochs=epochs
+                    )
+                    tensorboard.add_dict(dataclasses.asdict(metrics), global_step)
+
+                valid_triplets_acc.append(0)
 
         # Print training statistics for epoch and add to log
         print('Epoch {}:\tNumber of valid training triplets in epoch: {}'.format(
@@ -500,12 +598,13 @@ def main():
             f.writelines(log + '\n')
 
         # Evaluation pass on LFW dataset
-        best_distances = validate_lfw(
+        metrics = validate_lfw(
             model=model,
             lfw_dataloader=lfw_dataloader,
             model_architecture=model_architecture,
             epoch=epoch,
-            epochs=epochs
+            epochs=epochs,
+            log=True
         )
 
         # Save model checkpoint
@@ -516,7 +615,8 @@ def main():
             'model_state_dict': model.state_dict(),
             'model_architecture': model_architecture,
             'optimizer_model_state_dict': optimizer_model.state_dict(),
-            'best_distance_threshold': np.mean(best_distances)
+            'best_distance_threshold': metrics.distance,
+            "scaler": scaler.state_dict()
         }
 
         # For storing data parallel model's state dictionary without 'module' parameter
