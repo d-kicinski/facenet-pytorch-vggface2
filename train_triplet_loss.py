@@ -30,27 +30,6 @@ from models.resnet import (
     Resnet152Triplet
 )
 
-# Timing utilities
-import time
-start_time = None
-
-
-def start_timer():
-    global start_time
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_max_memory_allocated()
-    torch.cuda.synchronize()
-    start_time = time.time()
-
-
-def end_timer_and_print(local_msg):
-    torch.cuda.synchronize()
-    end_time = time.time()
-    print("\n" + local_msg)
-    print("Total execution time = {:.3f} sec".format(end_time - start_time))
-    print("Max memory used by tensors = {} bytes".format(torch.cuda.max_memory_allocated()))
-
 
 parser = argparse.ArgumentParser(description="Training a FaceNet facial recognition model using Triplet Loss.")
 parser.add_argument('--dataroot', '-d', type=str, required=True,
@@ -217,7 +196,6 @@ def set_optimizer(optimizer, model, learning_rate):
 
 
 def validate_lfw(model, lfw_dataloader, model_architecture, epoch, epochs, log=False):
-    model.eval()
     with torch.no_grad():
         l2_distance = PairwiseDistance(p=2)
         distances, labels = [], []
@@ -403,6 +381,7 @@ def main():
 
     # Load model to GPU or multiple GPUs if available
     model, flag_train_multi_gpu = set_model_gpu_mode(model)
+    model.train()
 
     # Set optimizer
     optimizer_model = set_optimizer(
@@ -441,18 +420,17 @@ def main():
     tensorboard_dir.mkdir(exist_ok=True, parents=True)
     tensorboard = Tensorboard(tensorboard_dir)
     global_step = 0
-    log_every_step = 500
-    evaluate_every_step = 2000
+    log_every_step = 200
+    evaluate_every_step = 1000
     losses: List[float] = []
-    valid_triplets_acc: List[int] = [0]
+    effective_batch_size_acc: List[int] = [0]
 
     scaler = GradScaler()
 
-    # start_epoch = 0
-    # epochs = 1
     use_amp = True
-    iters_to_accumulate = 6
-    # start_timer()
+    iters_to_accumulate = 0
+    min_batch_size = 128
+
     for epoch in range(start_epoch, epochs):
         num_valid_training_triplets = 0
         l2_distance = PairwiseDistance(p=2)
@@ -481,7 +459,6 @@ def main():
         )
 
         # Training pass
-        model.train()
         progress_bar = enumerate(tqdm(train_dataloader))
 
         for batch_idx, (batch_sample) in progress_bar:
@@ -534,16 +511,20 @@ def main():
                     positive=pos_valid_embeddings,
                     negative=neg_valid_embeddings
                 )
-                triplet_loss = triplet_loss / iters_to_accumulate
 
             # Calculating number of triplets that met the triplet selection method during the epoch
             num_valid_training_triplets += len(anc_valid_embeddings)
-            valid_triplets_acc[-1] += len(anc_valid_embeddings)
+            effective_batch_size_acc[-1] += len(anc_valid_embeddings)
+            iters_to_accumulate += 1
 
             scaler.scale(triplet_loss).backward()
 
-            if (batch_idx + 1) % iters_to_accumulate == 0:
-                # Backward pass
+            if effective_batch_size_acc[-1] >= min_batch_size:
+                scaler.unscale_(optimizer_model)
+                for p in model.parameters():
+                    p.grad /= iters_to_accumulate
+
+                # optimizer_model.param_groups
                 scaler.step(optimizer_model)
                 scaler.update()
                 optimizer_model.zero_grad()
@@ -558,19 +539,19 @@ def main():
                 if global_step % log_every_step == 0:
                     tensorboard.add_scalar(
                         name="loss_train",
-                        value=sum(losses) / len(losses),
+                        value=(sum(losses) / len(losses)) / iters_to_accumulate,
                         global_step=global_step,
                     )
                     tensorboard.add_scalar(
                         name="valid_triplets",
-                        value=sum(valid_triplets_acc) / len(valid_triplets_acc),
+                        value=sum(effective_batch_size_acc) / len(effective_batch_size_acc),
                         global_step=global_step,
                     )
                     losses: List[float] = []
-                    valid_triplets_acc: List[int] = [0]
+                    effective_batch_size_acc: List[int] = [0]
                 if global_step % evaluate_every_step == 0:
                     print("Validating on LFW!")
-
+                    model.eval()
                     metrics = validate_lfw(
                         model=model,
                         lfw_dataloader=lfw_dataloader,
@@ -578,9 +559,11 @@ def main():
                         epoch=epoch,
                         epochs=epochs
                     )
+                    model.train()
                     tensorboard.add_dict(dataclasses.asdict(metrics), global_step)
-
-                valid_triplets_acc.append(0)
+                # Reminder: this has to be at the end of this block
+                effective_batch_size_acc.append(0)
+                iters_to_accumulate = 0
 
         # Print training statistics for epoch and add to log
         print('Epoch {}:\tNumber of valid training triplets in epoch: {}'.format(
@@ -598,6 +581,7 @@ def main():
             f.writelines(log + '\n')
 
         # Evaluation pass on LFW dataset
+        model.eval()
         metrics = validate_lfw(
             model=model,
             lfw_dataloader=lfw_dataloader,
@@ -606,6 +590,7 @@ def main():
             epochs=epochs,
             log=True
         )
+        model.train()
 
         # Save model checkpoint
         state = {
