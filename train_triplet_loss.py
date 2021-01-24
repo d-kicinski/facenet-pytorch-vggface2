@@ -424,6 +424,7 @@ def main():
     evaluate_every_step = 1000
     losses: List[float] = []
     effective_batch_size_acc: List[int] = [0]
+    iters_to_accumulate_acc: List[int] = [0]
 
     scaler = GradScaler()
 
@@ -515,6 +516,7 @@ def main():
             # Calculating number of triplets that met the triplet selection method during the epoch
             num_valid_training_triplets += len(anc_valid_embeddings)
             effective_batch_size_acc[-1] += len(anc_valid_embeddings)
+            iters_to_accumulate_acc[-1] += 1
             iters_to_accumulate += 1
 
             scaler.scale(triplet_loss).backward()
@@ -522,7 +524,7 @@ def main():
             if effective_batch_size_acc[-1] >= min_batch_size:
                 scaler.unscale_(optimizer_model)
                 for p in model.parameters():
-                    p.grad /= iters_to_accumulate
+                    p.grad.div_(iters_to_accumulate)
 
                 # optimizer_model.param_groups
                 scaler.step(optimizer_model)
@@ -537,9 +539,10 @@ def main():
                 gc.collect()
 
                 if global_step % log_every_step == 0:
+                    iters_to_accumulate_mean = sum(iters_to_accumulate_acc) / len(iters_to_accumulate_acc)
                     tensorboard.add_scalar(
                         name="loss_train",
-                        value=(sum(losses) / len(losses)) / iters_to_accumulate,
+                        value=(sum(losses) / len(losses)) / iters_to_accumulate_mean,
                         global_step=global_step,
                     )
                     tensorboard.add_scalar(
@@ -547,50 +550,57 @@ def main():
                         value=sum(effective_batch_size_acc) / len(effective_batch_size_acc),
                         global_step=global_step,
                     )
+                    tensorboard.add_scalar(
+                        name="iters_to_accumulate",
+                        value=iters_to_accumulate_mean,
+                        global_step=global_step,
+                    )
                     losses: List[float] = []
                     effective_batch_size_acc: List[int] = [0]
-                if global_step % evaluate_every_step == 0:
-                    print("Validating on LFW!")
-                    model.eval()
-                    metrics = validate_lfw(
-                        model=model,
-                        lfw_dataloader=lfw_dataloader,
-                        model_architecture=model_architecture,
-                        epoch=epoch,
-                        epochs=epochs
-                    )
-                    model.train()
-                    tensorboard.add_dict(dataclasses.asdict(metrics), global_step)
+                    iters_to_accumulate_acc = [0]
+                # if global_step % evaluate_every_step == 0:
+                #     print("Validating on LFW!")
+                #     model.eval()
+                #     metrics = validate_lfw(
+                #         model=model,
+                #         lfw_dataloader=lfw_dataloader,
+                #         model_architecture=model_architecture,
+                #         epoch=epoch,
+                #         epochs=epochs
+                #     )
+                #     model.train()
+                #     tensorboard.add_dict(dataclasses.asdict(metrics), global_step)
                 # Reminder: this has to be at the end of this block
                 effective_batch_size_acc.append(0)
+                iters_to_accumulate_acc.append(0)
                 iters_to_accumulate = 0
 
         # Print training statistics for epoch and add to log
-        print('Epoch {}:\tNumber of valid training triplets in epoch: {}'.format(
-                epoch,
-                num_valid_training_triplets
-            )
-        )
+        # print('Epoch {}:\tNumber of valid training triplets in epoch: {}'.format(
+        #         epoch,
+        #         num_valid_training_triplets
+        #     )
+        # )
 
-        with open('logs/{}_log_triplet.txt'.format(model_architecture), 'a') as f:
-            val_list = [
-                epoch,
-                num_valid_training_triplets
-            ]
-            log = '\t'.join(str(value) for value in val_list)
-            f.writelines(log + '\n')
-
+        # with open('logs/{}_log_triplet.txt'.format(model_architecture), 'a') as f:
+        #     val_list = [
+        #         epoch,
+        #         num_valid_training_triplets
+        #     ]
+        #     log = '\t'.join(str(value) for value in val_list)
+        #     f.writelines(log + '\n')
+        #
         # Evaluation pass on LFW dataset
-        model.eval()
-        metrics = validate_lfw(
-            model=model,
-            lfw_dataloader=lfw_dataloader,
-            model_architecture=model_architecture,
-            epoch=epoch,
-            epochs=epochs,
-            log=True
-        )
-        model.train()
+        # model.eval()
+        # metrics = validate_lfw(
+        #     model=model,
+        #     lfw_dataloader=lfw_dataloader,
+        #     model_architecture=model_architecture,
+        #     epoch=epoch,
+        #     epochs=epochs,
+        #     log=True
+        # )
+        # model.train()
 
         # Save model checkpoint
         state = {
@@ -600,7 +610,7 @@ def main():
             'model_state_dict': model.state_dict(),
             'model_architecture': model_architecture,
             'optimizer_model_state_dict': optimizer_model.state_dict(),
-            'best_distance_threshold': metrics.distance,
+            # 'best_distance_threshold': metrics.distance,
             "scaler": scaler.state_dict()
         }
 
