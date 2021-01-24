@@ -389,6 +389,7 @@ def main():
         model=model,
         learning_rate=learning_rate
     )
+    scaler = GradScaler()
 
     # Resume from a model checkpoint
     if resume_path:
@@ -397,15 +398,19 @@ def main():
             checkpoint = torch.load(resume_path)
             start_epoch = checkpoint['epoch'] + 1
             optimizer_model.load_state_dict(checkpoint['optimizer_model_state_dict'])
+            scaler.load_state_dict(checkpoint['scaler'])
 
             # In order to load state dict for optimizers correctly, model has to be loaded to gpu first
             if flag_train_multi_gpu:
                 model.module.load_state_dict(checkpoint['model_state_dict'])
             else:
                 model.load_state_dict(checkpoint['model_state_dict'])
+            del checkpoint
+            gc.collect()
             print("Checkpoint loaded: start epoch from checkpoint = {}".format(start_epoch))
         else:
             print("WARNING: No checkpoint found at {}!\nTraining from scratch.".format(resume_path))
+
 
     if use_semihard_negatives:
         print("Using Semi-Hard negative triplet selection!")
@@ -426,13 +431,19 @@ def main():
     effective_batch_size_acc: List[int] = [0]
     iters_to_accumulate_acc: List[int] = [0]
 
-    scaler = GradScaler()
 
     use_amp = True
     iters_to_accumulate = 0
     min_batch_size = 128
 
     for epoch in range(start_epoch, epochs):
+        if epoch == 26:
+            for param_group in optimizer_model.param_groups:
+                print(f"Scalling learning rate."
+                      f" before: {param_group['lr']},"
+                      f" now: {param_group['lr'] * 0.1} ")
+                param_group['lr'] *= 0.1
+
         num_valid_training_triplets = 0
         l2_distance = PairwiseDistance(p=2)
         _training_triplets_path = None
@@ -543,6 +554,11 @@ def main():
                     tensorboard.add_scalar(
                         name="loss_train",
                         value=(sum(losses) / len(losses)) / iters_to_accumulate_mean,
+                        global_step=global_step,
+                    )
+                    tensorboard.add_scalar(
+                        name="loss_train_no_scale",
+                        value=(sum(losses) / len(losses)),
                         global_step=global_step,
                     )
                     tensorboard.add_scalar(
