@@ -13,9 +13,15 @@ class Resnet18Triplet(nn.Module):
                            Defaults to False.
     """
 
-    def __init__(self, embedding_dimension=512, pretrained=False):
+    def __init__(self, embedding_dimension=512, pretrained=False, layer_norm=True):
         super(Resnet18Triplet, self).__init__()
-        self.model = resnet18(pretrained=pretrained)
+
+        if layer_norm:
+            layer_norm = nn.BatchNorm2d
+        else:
+            layer_norm = nn.Identity
+
+        self.model = resnet18(pretrained=pretrained, norm_layer=layer_norm)
 
         # Output embedding
         input_features_fc_layer = self.model.fc.in_features

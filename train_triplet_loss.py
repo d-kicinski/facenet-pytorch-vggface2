@@ -29,6 +29,7 @@ from models.resnet import (
     Resnet101Triplet,
     Resnet152Triplet
 )
+from models.fixup_resnet_imagenet import FixUpResnet18Triplet
 
 
 parser = argparse.ArgumentParser(description="Training a FaceNet facial recognition model using Triplet Loss.")
@@ -41,7 +42,7 @@ parser.add_argument('--lfw', type=str, required=True,
 parser.add_argument('--dataset_csv', type=str, default='datasets/vggface2_full.csv',
                     help="Path to the csv file containing the image paths of the training dataset."
                     )
-parser.add_argument('--epochs', default=50, type=int,
+parser.add_argument('--epochs', default=100, type=int,
                     help="Required training epochs (default: 150)"
                     )
 parser.add_argument('--iterations_per_epoch', default=10000, type=int,
@@ -60,7 +61,7 @@ parser.add_argument('--embedding_dimension', default=256, type=int,
 parser.add_argument('--num_human_identities_per_batch', default=24, type=int,
                     help="Number of set human identities per generated triplets batch. (Default: 32)."
                     )
-parser.add_argument('--batch_size', default=192, type=int,
+parser.add_argument('--batch_size', default=128, type=int,
                     help="Batch size (default: 320)"
                     )
 parser.add_argument('--lfw_batch_size', default=64, type=int,
@@ -98,10 +99,15 @@ args = parser.parse_args()
 
 def set_model_architecture(model_architecture, pretrained, embedding_dimension):
     if model_architecture == "resnet18":
-        model = Resnet18Triplet(
-            embedding_dimension=embedding_dimension,
-            pretrained=pretrained
+        model = FixUpResnet18Triplet(
+            embedding_dimension=embedding_dimension
         )
+    # if model_architecture == "resnet18":
+    #     model = Resnet18Triplet(
+    #         embedding_dimension=embedding_dimension,
+    #         pretrained=pretrained,
+    #         layer_norm=True
+    #     )
     elif model_architecture == "resnet34":
         model = Resnet34Triplet(
             embedding_dimension=embedding_dimension,
@@ -333,6 +339,8 @@ def main():
     flag_training_triplets_path = False
     start_epoch = 0
 
+    global_step = 0
+
     if training_triplets_path is not None:
         flag_training_triplets_path = True  # Load triplets file for the first training epoch
 
@@ -399,6 +407,7 @@ def main():
             start_epoch = checkpoint['epoch'] + 1
             optimizer_model.load_state_dict(checkpoint['optimizer_model_state_dict'])
             scaler.load_state_dict(checkpoint['scaler'])
+            global_step = checkpoint["global_step"]
 
             # In order to load state dict for optimizers correctly, model has to be loaded to gpu first
             if flag_train_multi_gpu:
@@ -424,7 +433,6 @@ def main():
     tensorboard_dir = Path("logs/tensorboard")
     tensorboard_dir.mkdir(exist_ok=True, parents=True)
     tensorboard = Tensorboard(tensorboard_dir)
-    global_step = 0
     log_every_step = 200
     evaluate_every_step = 1000
     losses: List[float] = []
@@ -437,20 +445,23 @@ def main():
     min_batch_size = 128
 
     for epoch in range(start_epoch, epochs):
-        if epoch == 26:
-            for param_group in optimizer_model.param_groups:
-                print(f"Scalling learning rate."
-                      f" before: {param_group['lr']},"
-                      f" now: {param_group['lr'] * 0.1} ")
-                param_group['lr'] *= 0.1
+        # if epoch == 26:
+        #     for param_group in optimizer_model.param_groups:
+        #         print(f"Scalling learning rate."
+        #               f" before: {param_group['lr']},"
+        #               f" now: {param_group['lr'] * 0.1} ")
+        #         param_group['lr'] = param_group['lr'] * 0.1
 
         num_valid_training_triplets = 0
         l2_distance = PairwiseDistance(p=2)
         _training_triplets_path = None
 
-        if flag_training_triplets_path:
-            _training_triplets_path = training_triplets_path
-            flag_training_triplets_path = False  # Only load triplets file for the first epoch
+        flag_training_triplets_path = Path(f"datasets/generated_triplets/epoch_{epoch}_training_triplets_1920000_identities_24_batch_192.npy")
+
+        if flag_training_triplets_path.exists():
+            _training_triplets_path = str(flag_training_triplets_path)
+        else:
+            _training_triplets_path = None
 
         # Re-instantiate training dataloader to generate a triplet list for this training epoch
         train_dataloader = torch.utils.data.DataLoader(
@@ -627,7 +638,8 @@ def main():
             'model_architecture': model_architecture,
             'optimizer_model_state_dict': optimizer_model.state_dict(),
             # 'best_distance_threshold': metrics.distance,
-            "scaler": scaler.state_dict()
+            "scaler": scaler.state_dict(),
+            "global_step": global_step
         }
 
         # For storing data parallel model's state dictionary without 'module' parameter
