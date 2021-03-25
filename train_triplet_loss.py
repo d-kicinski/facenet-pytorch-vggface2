@@ -30,6 +30,7 @@ from models.resnet import (
     Resnet152Triplet
 )
 from models.fixup_resnet_imagenet import FixUpResnet18Triplet
+from models_v2 import Resnet18Embedding, Resnet18Fixup, Resnet18EmbeddingFixup, GroupNorm
 
 
 parser = argparse.ArgumentParser(description="Training a FaceNet facial recognition model using Triplet Loss.")
@@ -42,13 +43,14 @@ parser.add_argument('--lfw', type=str, required=True,
 parser.add_argument('--dataset_csv', type=str, default='datasets/vggface2_full.csv',
                     help="Path to the csv file containing the image paths of the training dataset."
                     )
-parser.add_argument('--epochs', default=100, type=int,
+parser.add_argument('--epochs', default=200, type=int,
                     help="Required training epochs (default: 150)"
                     )
 parser.add_argument('--iterations_per_epoch', default=10000, type=int,
                     help="Number of training iterations per epoch (default: 10000)"
                     )
-parser.add_argument('--model_architecture', type=str, default="resnet18", choices=["resnet18",
+parser.add_argument('--model_architecture', type=str, default="custom", choices=["custom",
+                                                                                 "resnet18",
                                                                             "resnet34", "resnet50", "resnet101", "resnet152", "inceptionresnetv2", "mobilenetv2"],
                     help="The required model architecture for training: ('resnet18','resnet34', 'resnet50', 'resnet101', 'resnet152', 'inceptionresnetv2', 'mobilenetv2'), (default: 'resnet18')"
                     )
@@ -76,10 +78,10 @@ parser.add_argument('--resume_path', default='',  type=str,
 parser.add_argument('--num_workers', default=4, type=int,
                     help="Number of workers for data loaders (default: 2)"
                     )
-parser.add_argument('--optimizer', type=str, default="adam", choices=["sgd", "adagrad", "rmsprop", "adam"],
+parser.add_argument('--optimizer', type=str, default="adagrad", choices=["sgd", "adagrad", "rmsprop", "adam"],
                     help="Required optimizer for training the model: ('sgd','adagrad','rmsprop','adam'), (default: 'adagrad')"
                     )
-parser.add_argument('--learning_rate', default=0.001, type=float,
+parser.add_argument('--learning_rate', default=0.05, type=float,
                     help="Learning rate for the optimizer (default: 0.1)"
                     )
 parser.add_argument('--margin', default=0.2, type=float,
@@ -98,16 +100,15 @@ args = parser.parse_args()
 
 
 def set_model_architecture(model_architecture, pretrained, embedding_dimension):
-    if model_architecture == "resnet18":
-        model = FixUpResnet18Triplet(
+    if model_architecture == "custom":
+        model = Resnet18EmbeddingFixup(
             embedding_dimension=embedding_dimension
         )
-    # if model_architecture == "resnet18":
-    #     model = Resnet18Triplet(
-    #         embedding_dimension=embedding_dimension,
-    #         pretrained=pretrained,
-    #         layer_norm=True
-    #     )
+    if model_architecture == "resnet18":
+        model = Resnet18Triplet(
+            embedding_dimension=embedding_dimension,
+            pretrained=pretrained,
+        )
     elif model_architecture == "resnet34":
         model = Resnet34Triplet(
             embedding_dimension=embedding_dimension,
@@ -176,6 +177,7 @@ def set_optimizer(optimizer, model, learning_rate):
             lr=learning_rate,
             lr_decay=0,
             initial_accumulator_value=0.1,
+            weight_decay=2e-4,
             eps=1e-10
         )
 
@@ -442,21 +444,21 @@ def main():
 
     use_amp = True
     iters_to_accumulate = 0
-    min_batch_size = 128
+    min_batch_size = 120
 
     for epoch in range(start_epoch, epochs):
-        # if epoch == 26:
-        #     for param_group in optimizer_model.param_groups:
-        #         print(f"Scalling learning rate."
-        #               f" before: {param_group['lr']},"
-        #               f" now: {param_group['lr'] * 0.1} ")
-        #         param_group['lr'] = param_group['lr'] * 0.1
+        if epoch == 100:
+            for param_group in optimizer_model.param_groups:
+                print(f"Scalling learning rate."
+                      f" before: {param_group['lr']},"
+                      f" now: {param_group['lr'] * 0.1} ")
+                param_group['lr'] = param_group['lr'] * 0.1
 
         num_valid_training_triplets = 0
         l2_distance = PairwiseDistance(p=2)
         _training_triplets_path = None
 
-        flag_training_triplets_path = Path(f"datasets/generated_triplets/epoch_{epoch}_training_triplets_1920000_identities_24_batch_192.npy")
+        flag_training_triplets_path = Path(f"datasets/generated_triplets/epoch_{epoch}_training_triplets_1280000_identities_24_batch_128.npy")
 
         if flag_training_triplets_path.exists():
             _training_triplets_path = str(flag_training_triplets_path)
